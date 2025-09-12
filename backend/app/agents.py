@@ -37,6 +37,42 @@ class Limits:
         return offer_count < self.max_offers
 
 # Negotiation Agents
+class AdaptiveAgent:
+    def __init__(self, agent_id, actions, state_space_size, target_price=50, min_price=40, max_price=60, quantity=10):
+        self.agent_id = agent_id
+        self.actions = actions
+        self.state_space_size = state_space_size
+        self.q_table = np.zeros((state_space_size, len(actions)))
+        self.epsilon = 0.1
+        self.alpha = 0.5
+        self.gamma = 0.9
+
+        # negotiation attributes
+        self.target_price = float(target_price)
+        self.min_price = float(min_price)
+        self.max_price = float(max_price)
+        self.quantity = int(quantity)
+
+    def select_action(self, state):
+        if np.random.rand() < self.epsilon:
+            return np.random.choice(self.actions)
+        return self.actions[np.argmax(self.q_table[state])]
+
+    def update(self, state, action, reward, next_state):
+        a_idx = self.actions.index(action)
+        best_next = np.max(self.q_table[next_state])
+        self.q_table[state, a_idx] += self.alpha * (reward + self.gamma * best_next - self.q_table[state, a_idx])
+
+    def propose(self, last_offer_price=None):
+        if last_offer_price is None:
+            return self.target_price
+        delta = last_offer_price - self.target_price
+        return float(self.target_price + delta * 0.5)
+
+    def utility(self, price: float) -> float:
+        return 1.0 - abs(price - self.target_price) / max(1.0, abs(self.max_price - self.min_price))
+
+    
 class BaseAgent:
     def __init__(self, address: str, target_price: float, min_price: float, max_price: float, quantity: int, fairness_weight=0.5):
         self.address = address
@@ -66,6 +102,18 @@ def run_negotiation_loop(buyer_agent: BaseAgent, seller_agent: BaseAgent, max_ro
     timeline = []
     last_buyer = None
     last_seller = None
+    # Optionally, pass db_session if you want to record experiences in DB
+    db_session = None
+    try:
+        from sqlmodel import Session, create_engine
+        from .models import SQLModel
+        import os
+        DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")
+        engine = create_engine(DATABASE_URL, echo=False)
+        db_session = Session(engine)
+    except Exception:
+        pass
+
     for r in range(1, max_rounds+1):
         # buyer proposes
         bprice = buyer_agent.propose(last_seller)
@@ -83,11 +131,28 @@ def run_negotiation_loop(buyer_agent: BaseAgent, seller_agent: BaseAgent, max_ro
             "seller_util": float(seller_util),
             "fairness": float(fairness)
         })
+
+        # --- AdaptiveAgent integration ---
+        # If agents are AdaptiveAgent, record experience and update Q-table
+        state = r - 1  # Example: use round number as state (customize as needed)
+        next_state = r
+        reward = fairness  # Example: use fairness as reward (customize as needed)
+        if hasattr(buyer_agent, "update") and hasattr(buyer_agent, "record_experience"):
+            buyer_agent.record_experience(db_session, state, bprice, reward, next_state)
+            buyer_agent.update(state, bprice, reward, next_state)
+        if hasattr(seller_agent, "update") and hasattr(seller_agent, "record_experience"):
+            seller_agent.record_experience(db_session, state, sprice, reward, next_state)
+            seller_agent.update(state, sprice, reward, next_state)
+
         # check acceptance: if seller offer close to buyer offer within threshold
         if abs(bprice - sprice) <= 1.0 or fairness >= 0.9:
             final_price = (bprice + sprice) / 2.0
+            if db_session:
+                db_session.close()
             return timeline, {"price": float(final_price), "quantity": buyer_agent.quantity, "fairness": fairness}
         last_buyer, last_seller = bprice, sprice
     # if max rounds reached, choose pareto best: pick midpoint of last offers
     lp = (last_buyer + last_seller) / 2.0
+    if db_session:
+        db_session.close()
     return timeline, {"price": float(lp), "quantity": buyer_agent.quantity, "fairness": timeline[-1]["fairness"] if timeline else 1.0}
